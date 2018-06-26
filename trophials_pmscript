@@ -1,0 +1,440 @@
+use application "common";
+if( $_[0] ){
+  tropicalize();
+}else{
+#   print "to do";
+}
+################################################
+sub tropicalize {
+  print "---- trophials_pmscript starts ----\n";
+  use application "matroid";
+  use vars '$matroid','$n_bases','@fans','$read_name','$write_name','$n_max','$weights_to_zero','@rays_of','@weights_of','$avoid','$all_rows','$const_coord','$ray_pos','$ray_neg','$rays','$weights','$rays_temp','$weights_temp','$lineality','$update_basis','$proj_ray','$current_gcd','$current_ray','$current_rays','$update_rays','$rays_final','$weights_final','$t','$file','$v','$missingFlatRankMatrix','$ray';
+  # '$lattice','$rays2','$weights2',
+  # 1. load matroid
+  script("polymake_data_matroid");
+  $matroid = new Matroid(N_ELEMENTS=>$n_elements,BASES=>$Bases);
+  $n_bases = $matroid->BASES->size;
+  # 2. Compute all local fans
+  $read_name = "polymake_data_";
+  $write_name = "singular_data";
+  # 3. Compute T_B for all bases B of $matroid
+  for(my $i = 1; $i <= $n_bases; $i++){
+    script($read_name.$i);				# Load data (Newton polytope f_B)
+    use application "tropical";
+    $fans[$i-1] = new Hypersurface<Max>(POLYNOMIAL=>toTropicalPolynomial(MatrixToTropicalPolynomial($m)));	# Create T_B, save in "@fans"
+    $avoid = avoidRow($fans[$i-1]->VERTICES->col(0));	# Find the row corresponding to the vertex of the fan
+    # In the following we do not work with fans. Instead, we create a matrices "rays", "weights" and work with them.
+    # In order to produce these matrices for each fan, the following special case appears:  
+    # ATTENTION: if N_MAXIMAL_POLYTOPES == 1 then the fan is purely a lineality space and the fan $fans[$i-1] must be examined in detail.
+    if( $fans[$i-1]->N_MAXIMAL_POLYTOPES == 1 ){	# If FAN = LINEALITY SPACE
+      # If the lineality space is contained in x_i-x_j = 0 for some i,j then "Hypersurface" deletes a redundant variable.
+      # If the lineality space is not contained in a hyperplane mentioned above we can use the attribute "->LINEALITY_SPACE".
+      $const_coord = checkSupport($m);
+      if( $const_coord == -1 ){							# const_coord = -1 iff LINEALITY is NOT equal to x_i-x_j
+	$v = new Vector<Int>(primitive($fans[$i-1]->LINEALITY_SPACE->row(0)));	# We can use the generator of the lineality space.
+	$ray_pos = $v->slice([1,2,3]);						# Split it into a positive and negative generator
+	$ray_neg = -$v->slice([1,2,3]);
+	$rays = new Matrix<Int>();
+	$rays /= $ray_neg;
+	$rays /= $ray_pos;
+	$rays = primitive($rays);
+	$weights = new Vector<Int>([$fans[$i-1]->WEIGHTS->[0],$fans[$i-1]->WEIGHTS->[0]]);	# Copy the weight.
+	$rays_of[$i-1] = $rays;
+	$weights_of[$i-1] = $weights;						# Done!
+      }else{									# const_coord = k iff LINEALITY is equal to x_i - x_j
+	$rays = new Matrix<Int>(2,3);
+	$rays->elem(0,$const_coord) = 1;						# The rows of the matrix $rays generate the lineality space
+	$rays->elem(1,$const_coord) = -1;
+	$weights = new Vector<Int>([$fans[$i-1]->WEIGHTS->[0],$fans[$i-1]->WEIGHTS->[0]]);	# Copy the weight.
+	$rays_of[$i-1] = $rays;
+	$weights_of[$i-1] = $weights;						# Done!
+      }
+    }else{					# If FAN != LINEALITY_SPACE
+      $all_rows = new Set<Int>([0..$fans[$i-1]->N_VERTICES-1]);				# Index set for all rows.
+      $rays_of[$i-1] = primitive($fans[$i-1]->VERTICES->minor($all_rows-$avoid,[1,2,3]));	# Rays of the fan with the vertex removed.
+      $weights = new Vector<Int>($fans[$i-1]->N_MAXIMAL_POLYTOPES);			# Create weight vector.
+      for(my $j = 0; $j < $weights->dim; $j++){
+	my $variable = $fans[$i-1]->MAXIMAL_POLYTOPES->[$j]-$avoid;			# Get ray index without vertex index
+	$variable = $variable->front;						# Therefore remove $avoid (=vertex index)
+	if( $variable < $avoid ){							# Pick correct weight ...
+	  $weights->[$variable] = $fans[$i-1]->WEIGHTS->[$j];
+	}
+	if( $variable > $avoid ){
+	  $weights->[$variable - 1] = $fans[$i-1]->WEIGHTS->[$j];
+	}
+      }
+      $weights_of[$i-1] = $weights;							# Done!
+    }
+  }
+  # All T_B computed!
+  # If a T_B is just a line (a lineality space respectively) we consider it subdivided into two rays v and -v.
+  # This is necessary due to the weight class subdivision of B(M|B)!
+  ######################################################################################################################################
+  # IDEA: To check that we proceed correctly we create a matrix $weights_to_zero.
+  # If we lift a ray we update all fans and subtract the weight in $weights_to_zero.
+  # In the end every entry of $weights_to_zero should be zero.
+  # Moreover we create a matrix $missingFlatRankMatrix where we save the missing rank for each flag of flats.
+  # Create $weights_to_zero. Therefore find N_MAXIMAL_POLYTOPES
+  $n_max = $weights_of[0]->dim;
+  for( my $i = 1; $i < $n_bases; $i++ ){
+    if( $n_max < $weights_of[$i]->dim ){
+      $n_max = $weights_of[$i]->dim;
+    }
+  }
+  # Now we know the necessary size of $weights_to_zero and $missingFlatRankMatrix
+  $weights_to_zero = new Matrix<Int>($n_bases,$n_max);
+  $missingFlatRankMatrix = new Matrix<Int>($n_bases,$n_max);
+  # copy weights and compute missing flat ranks
+  for(my $i = 0; $i < $n_bases; $i++){
+    for(my $j = 0; $j < $weights_of[$i]->dim; $j++){
+      $weights_to_zero->elem($i,$j) = $weights_of[$i]->[$j];
+      $missingFlatRankMatrix->elem($i,$j) = missingFlatRank($rays_of[$i]->row($j));
+    }
+  }
+#   print "weights_to_zero:\n",$weights_to_zero,"\n";											# print
+  # $weights_to_zero created!
+  $weights_temp = new Vector<Int>($n_bases*$n_max);
+  $rays_temp = new Matrix<Int>();
+  $lineality = ones_vector(4);
+  my $counter = 0;
+  
+  for( my $rank = 0; $rank <= 2; $rank++ ){		# 1. loop: $rank is missing flat rank
+#     print "Look for flags missing flat of rank ",$rank,"\n";										# print
+    for( my $i = 0; $i < $n_bases; $i++){			# 2. loop: $i is current fan/basis
+#       print "... in fan ",$i," with ",$rays_of[$i]->rows," rays.\n";									# print
+      $basis = new Vector<Int>($Bases->[$i]);		# Current basis
+      $current_rays = new Matrix<Int>($rays_of[$i]);	# Current rays (must do this: ERRORS otherwise ... strange.)
+      for(my $j = 0; $j < $weights_of[$i]->dim; $j++){	# 3. loop: $j current ray of fan $i      
+	# Is there something to do with this cone?! In particular, non-zero weight and missing flat of rank $rank?
+	if( $weights_to_zero->elem($i,$j) && $missingFlatRankMatrix->elem($i,$j) == $rank ){
+	  $v = primitive($current_rays->row($j));					# Consider primitive version of ray
+# 	  print "Lift this ray! Fan ",$i,", ",$j,"-th ray: ",$v,", weight ",$weights_to_zero->elem($i,$j),". Update!\n";		# print
+	  $ray = new Vector<Int>(liftRay($v,$matroid,$basis));			# Lift the ray
+# 	  print "Lifted ray: ",$ray,"\n";												# print
+	  $ray = makeVectorCoordinateZero($ray,0,ones_vector($ray->dim));		# Make first coordinate equal to zero, convert to matrix
+# 	  print "First coordinate equal to zero: ",$ray,"\n";										# print
+	  $rays_temp /= $ray;								# Add ray to result $rays_temp
+	  $weights_temp->[$rays_temp->rows-1] = $weights_to_zero->elem($i,$j);		# Add weight to result $weights_temp
+	  # Update all fans
+	  for(my $l = 0; $l < $n_bases; $l++){
+	    $update_basis = $Bases->[$l];					# Basis B corresponding to T_B we want to update
+# 	    print "Update basis ",$update_basis,", fan ",$l,"\n";									# print
+	    $proj_ray = $ray->slice($update_basis);				# Consider projection p_B($ray)
+	    $proj_ray = makeVectorCoordinateZero($proj_ray,0,ones_vector(3));	# First coordinate to zero
+	    if( $proj_ray != zero_vector(3) ){					# Is p_B($ray) != zero vector?
+	      $current_gcd = gcd(new Vector<Int>($proj_ray));			# Compute the greatest common divisor
+	      $proj_ray = primitive($proj_ray);					# Consider primitive version of p_B($ray)
+	      $update_rays = new Matrix<Int>($rays_of[$l]);			# Copy rays of T_B
+	      for( my $s = 0; $s < $rays_of[$l]->rows; $s++){			# Compare all rays of T_B with p_B($ray)
+		# print "check ray ",$s,"\n";
+		$current_ray = primitive(makeVectorCoordinateZero($update_rays->row($s),0,ones_vector(3)));
+		if( $current_ray == $proj_ray and $weights_to_zero->elem($l,$s)!= 0){	# vorher: primitive($proj_ray)	# If coincidence then change value in $weights_to_zero
+#   		print "Hit: ray ",$s," = ",$rays_of[$l]->row($s)," of fan ",$l,"\n";							# print
+		  $weights_to_zero->elem($l,$s) = $weights_to_zero->elem($l,$s) - $current_gcd*$weights_temp->[$rays_temp->rows-1];
+		}
+	      }
+	    }
+	  } 									# Update done!
+#   	print "Updated weights_to_zero:\n";												# print
+#   	print $weights_to_zero;														# print
+	}										# Done with ray $j of fan $i
+      }										# Loop over rays
+    }										# Loop over fans
+  }										# Loop over $rank
+  if( $weights_to_zero != zero_matrix($weights_to_zero->rows,$weights_to_zero->cols) ){
+    print "---- Not all weights are zero! ----\n";
+    print $weights_to_zero;
+  }else{
+  # print "Ready to create final output\n";
+    $rays_final = new Matrix<Int>($rays_temp);
+    $weights_final = new Vector<Int>($rays_final->rows);
+    my $weights_counter = 0;
+    while( $weights_counter < $rays_final->rows ){
+      $weights_final->[$weights_counter] = $weights_temp->[$weights_counter];
+      $weights_counter++;
+    }
+    $lineality = ones_vector($rays_final->cols);
+  }
+  # Translate result to strings and write into file for singular
+  $rays = MatrixToString($rays_final,"rays");				# Save rays for singular
+  $lineality = VectorToString($lineality,"lineality");			# Save lineality space
+  $weights = VectorToString($weights_final,"weights");			# Save weights 
+  $t = $rays.$lineality.$weights;						# Write into string
+  $file = $write_name;							# Give file a name
+  open FILE,'>'.$file;print FILE $t;close FILE;				# Write!
+  print "---- trophials_pmscript done! ----\n";
+}
+################################################
+sub avoidRow {
+  use application "common";
+  my $v = $_[0];
+  for(my $i = 0; $i < $v->dim; $i++){
+    if( $v->[$i] == 1 ){
+      return $i;
+    }
+  }
+  print "Something is wrong. Fan without vertex?\n";
+}
+################################################
+sub checkSupport {
+use application "tropical";
+
+	my $mat = $_[0];
+
+	my $const_coord = -1;
+
+	# lineality space = x_i - x_j and polymake forgets about redundant coordinate
+	# goal: add redundant coordinate
+
+	for( my $i = 0; $i < $mat->cols; $i++){
+		if( $mat->col($i) == $mat->elem(0,$i)*ones_vector($mat->rows) ){
+			$const_coord = $i;
+		}
+	}
+
+	return $const_coord;
+}
+################################################
+sub makeVectorCoordinateZero {				# INPUT: 1. Vector<Int>, 2. coordinate, 3. lineality vector
+use application "common";
+use vars '$res';
+$res = new Vector<Int>();
+
+if( $_[0]->[$_[1]] != 0 ){
+	$res = $_[0]-($_[0]->[$_[1]])*$_[2];
+	return $res;
+}else{
+return $_[0];
+}							# RETURN: vector<int> with specified coordinate equal to zero (using lineality vector)
+}
+################################################
+sub translateToBasis {					# INPUT: 1. old set i_1,...,i_k 2. basis
+use application "common";
+use vars '$basis','$set_new','$set_old';
+$set_old = new Vector<Int>($_[0]);
+$basis = new Vector<Int>($_[1]);
+$set_new = new Set<Int>();
+for( my $i = 0; $i < $set_old->dim; $i++){
+	$set_new = $set_new + $basis->[$set_old->[$i]];
+}
+return $set_new;
+}							# RETURN: new set b_{i_1},...,b_{i_k}
+################################################
+sub MatrixToString {
+use application "common";
+
+use vars '$k','$s','$v','@list';
+my $mat = new Matrix<Rational>($_[0]);
+my $n = $mat->cols;
+my $m = $mat->rows;
+$s = "matrix ";
+$s = $s.$_[1];
+
+$s = $s."["; $s = $s.$m; $s = $s."]["; $s = $s.$n; $s = $s."]=";
+
+foreach my $i (1..$m) {
+	$v = $mat->row($i-1);
+	foreach my $j (0..$n-1) {
+		$s = $s.$v->[$j];
+		if(($i != $m) || ($j != $n-1)){
+			$s = $s.",";
+		}
+		else{
+			$s = $s.";";
+		}
+	}
+}
+
+return $s;
+}
+################################################
+sub VectorToString {
+use application "common";
+
+use vars '$s','$v','$n';
+
+$v = new Vector<Int>($_[0]);
+$n = $v->dim;
+
+$s = "matrix ";
+$s = $s.$_[1];
+
+$s = $s."[1]["; $s = $s.$n; $s = $s."]=";
+
+foreach my $i (0..$n-1) {
+	$s = $s.$v->[$i];
+	if( ($i != $n - 1) ){
+		$s = $s.",";
+	}
+	else{
+		$s = $s.";";
+	}
+}
+
+return $s;
+}
+################################################
+sub ArrayToList {
+use application "common";
+my $k;
+my $s;
+my $A = $_[0];
+my $n = $A->rows;
+my $L = "list ";
+$L = $L.$_[1];
+$L = $L."=";
+foreach my $i (1..$n) {
+	$s = $A->[$i-1];
+	$k = $s->size;
+	$L = $L."intvec(";
+	foreach my $j (1..$k) {
+		$L = $L.($s->[$j-1]+1);
+		if( $j != $k ){
+			$L = $L.",";
+		}
+		if( ($j == $k) && ($i != $n)){
+			$L = $L."),";
+		}
+		if( ($j == $k) && ($i == $n) ){
+			$L = $L.");";
+		}
+	}
+}
+return $L;
+}
+################################################
+sub MatrixToTropicalPolynomial {			# used!
+use application "common";
+use vars '$t','$d','$sum';
+
+$sum = 0;
+
+foreach my $i (1..$m->cols) {
+	$sum = $sum + $m->row(0)->[$i-1];
+}
+
+$t = new String();
+$t = $t."max(";
+
+foreach my $i (1..$_[0]->rows) {
+	$d = 0;
+	foreach my $j (1..$_[0]->cols) {
+		if( ($_[0]->row($i-1)->[$j-1]) != 0 ) {
+			$t = $t.($_[0]->row($i-1)->[$j-1])."*x".($j-1);
+			$d = $d + ($_[0]->row($i-1)->[$j-1]);
+			if( $d != $sum ) {
+				$t = $t."+";
+			}else{
+				if( $i != $_[0]->rows ) {
+					$t = $t.",";
+				}else{
+					$t = $t.")";
+				}
+			}
+		}
+		
+	}
+}
+
+return $t;
+}
+################################################
+sub minIndices {					# INPUT: vector v
+use application "common";
+use vars '$min','$set','$remain';
+# print "vector: ",$_[0],"\n";
+# print "avoid: ",$_[1],"\n";
+$remain = new Set<Int>(0..$_[0]->dim - 1);
+$remain = $remain - $_[1];
+$remain = new Vector<Int>($remain);
+# print $remain;
+$min = $_[0]->[$remain->[0]];
+$set = new Set<Int>();
+# print "start with min = ",$min;
+
+for(my $i = 1; $i < $remain->dim; $i++){
+	if( $_[0]->[$remain->[$i]] < $min ){
+		$min = $_[0]->[$remain->[$i]];
+	}
+}
+
+for(my $i = 0; $i < $remain->dim; $i++){
+      if( $_[0]->[$remain->[$i]] == $min ){
+	    $set = $set + $remain->[$i];
+      }
+}
+return $set;
+}							# RETURN: indices where v_i is minimal
+################################################
+sub missingFlatRank {					# INPUT: 1xn vector ray
+  my $v = new Vector<Int>($_[0]);
+  my $set = minIndices($v,new Set<Int>());
+  if( $set->size == 3){
+    return -1;
+  }
+  if( $set->size == 2 ){
+    return 1;
+  }else{
+    if( minIndices($v,$set)->size == 2 ){
+      return 2;
+    }else{
+      return 0;
+    }
+  }
+}							# RETURN: integer "rank" of missing flat (= 0 iff no flat, = -1 iff two flats)
+################################################
+sub closureOf {						# INPUT: 1. set, 2. lattice
+use application "common";
+use vars '$lattice','$set','$flat_indices';
+
+$set = $_[0];
+$lattice = $_[1];
+$flat_indices = new Array<Int>($lattice->nodes_of_dim($set->size));
+
+# print "Consider set ",$set,"\n";
+
+for(my $i = 0; $i <= $flat_indices->size - 1; $i++){
+# 	print "Contained in ",$lattice->FACES->[$flat_indices->[$i]],"?\n";
+	if( incl($set,$lattice->FACES->[$flat_indices->[$i]]) == -1 || incl($set,$lattice->FACES->[$flat_indices->[$i]]) == 0 ){
+# 		print "Yes!\n";
+		$set = new Set<Int>($lattice->FACES->[$flat_indices->[$i]]);
+		return $set;
+	}
+# 	print "No.\n";
+}
+print "Something is wrong, no flat found!\n";
+return $set;
+}
+################################################
+sub liftRay {						# INPUT: local vector v, matroid m, bases b
+use application "common";
+my $v = $_[0];
+my $matroid = $_[1];
+my $basis = $_[2];
+
+my $avoid = new Set<Int>();
+my $columns = new Set<Int>([0,1,2]);
+my $flat_old = new Set<Int>();
+my $flat_new_only = new Set<Int>();
+my $flat_new = new Set<Int>();
+my $lattice = $matroid->LATTICE_OF_FLATS;
+my $new_mins = new Set<Int>();
+my $old_mins = new Set<Int>();
+my $ray = new Vector<Int>($matroid->N_ELEMENTS);
+
+while( $avoid != $columns ){
+	$new_mins = minIndices($v,$avoid);
+	$avoid = $avoid+$new_mins;
+	$flat_new = new Set<Int>(closureOf(translateToBasis($avoid,$basis),$lattice));
+	
+	$flat_new_only = $flat_new - $flat_old;
+	$flat_old = $flat_new;
+	$flat_new_only = new Vector<Int>($flat_new_only);
+	$new_mins = new Vector<Int>($new_mins);
+	for(my $l = 0; $l < $flat_new_only->dim; $l++){
+		$ray->[$flat_new_only->[$l]] = $v->[$new_mins->[0]];
+	}
+}
+# print "liftRay done\n";
+return $ray;
+}							# RETURN: (p_B)^(-1)(v') = v element of Bergman fan B(M)
